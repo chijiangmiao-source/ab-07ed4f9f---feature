@@ -24,6 +24,15 @@ class IdConflictError(Exception):
         super().__init__("audit_id 已绑定不同载荷")
 
 
+class RepairConflictError(Exception):
+    """同一修复标识已绑定（不同）来源；已冻结修复保持不变。"""
+
+    def __init__(self, existing: dict, new_fingerprint: str):
+        self.existing = existing
+        self.new_fingerprint = new_fingerprint
+        super().__init__("repair_id 已绑定不同来源审计")
+
+
 def canonical_json(payload: dict) -> bytes:
     return json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -43,6 +52,10 @@ class AuditStore:
     def _path(self, audit_id: str) -> str:
         safe = hashlib.sha256(audit_id.encode("utf-8")).hexdigest()
         return os.path.join(self.data_dir, f"{safe}.json")
+
+    def _repair_path(self, repair_id: str) -> str:
+        safe = hashlib.sha256(repair_id.encode("utf-8")).hexdigest()
+        return os.path.join(self.data_dir, f"repair-{safe}.json")
 
     def get(self, audit_id: str) -> dict | None:
         path = self._path(audit_id)
@@ -83,3 +96,56 @@ class AuditStore:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+
+    # ---- 最小上界放宽修复（独立文件；从不改写来源审计） ----
+    def get_repair(self, repair_id: str) -> dict | None:
+        path = self._repair_path(repair_id)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+
+    def submit_repair(self, repair_id: str, source_snapshot: dict,
+                      result: dict) -> tuple[dict, bool]:
+        """冻结一条放宽修复。
+
+        ``source_snapshot`` 只包含对来源审计的只读引用与快照（编号、指纹、
+        规范变量、约束顺序、稳定标识与原证据摘要），本方法绝不写来源文件。
+        同标识重放要求绑定同一来源（编号与指纹均相同），否则抛
+        :class:`RepairConflictError`。
+        """
+        source_key = {
+            "audit_id": source_snapshot["audit_id"],
+            "fingerprint": source_snapshot["fingerprint"],
+        }
+        new_fp = fingerprint(source_key)
+        with self._lock:
+            existing = self.get_repair(repair_id)
+            if existing is not None:
+                if existing["source_binding_fingerprint"] != new_fp:
+                    raise RepairConflictError(existing, new_fp)
+                return existing, True
+
+            record = {
+                "kind": "min-rhs-relaxation",
+                "repair_id": repair_id,
+                "created_at": datetime.now(timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"),
+                "source_binding_fingerprint": new_fp,
+                "source": source_snapshot,
+                "result": result,
+                "method": (
+                    "exact-rational-two-phase-simplex/Bland;"
+                    "min-sum-then-lex-by-stable-flag-order"
+                ),
+            }
+            path = self._repair_path(repair_id)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(record, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+            return record, False

@@ -110,6 +110,26 @@
     <div id="result-meta" class="muted" style="margin-bottom:10px"></div>
     <div id="result-body"></div>
   </section>
+
+  <section id="repair-panel" class="panel" hidden>
+    <h2>最小上界放宽修复 <span class="badge ok">首次可行</span></h2>
+    <div id="repair-meta" class="muted" style="margin-bottom:10px"></div>
+    <div id="repair-body"></div>
+  </section>
+
+  <section class="panel">
+    <h2>4. 按编号重读已冻结修复</h2>
+    <div class="toprow">
+      <div>
+        <label for="repair-fetch-id">修复编号 repair_id</label>
+        <input type="text" id="repair-fetch-id" placeholder="如 trap-run-2026-09-28-A-fix-1">
+      </div>
+      <div style="flex:0 0 auto">
+        <button class="secondary" id="repair-fetch">按编号取回修复</button>
+      </div>
+    </div>
+    <div id="repair-fetch-error"></div>
+  </section>
 </main>
 
 <script>
@@ -225,6 +245,7 @@ function frac(v) { return `<span class="num frac">${escapeHtml(v)}</span>`; }
 function renderResult(rec, replayed) {
   const panel = document.getElementById('result-panel');
   panel.hidden = false;
+  document.getElementById('repair-panel').hidden = true;
   const r = rec.result;
   const badge = document.getElementById('result-badge');
   if (r.status === 'feasible') {
@@ -239,8 +260,7 @@ function renderResult(rec, replayed) {
     `载荷指纹 <span class="num">${escapeHtml(rec.fingerprint.slice(0,25))}…</span>`;
 
   let html = '';
-  if (r.status === 'feasible') {
-    html += '<h3 style="margin:6px 0">有理电流（固定枢轴规则给出的一组精确解）</h3>';
+  if (r.status === 'feasible') {    html += '<h3 style="margin:6px 0">有理电流（固定枢轴规则给出的一组精确解）</h3>';
     html += '<div class="scroll"><table><thead><tr><th>变量</th><th>电流值</th></tr></thead><tbody>';
     for (const [k, v] of Object.entries(r.currents)) {
       html += `<tr><td>${escapeHtml(k)}</td><td>${frac(v)}</td></tr>`;
@@ -268,8 +288,19 @@ function renderResult(rec, replayed) {
     html += '</tbody></table></div>';
     html += `<p style="margin-top:12px">逐项相加合并式：左侧 = <span class="num">[${r.combined_lhs.map(escapeHtml).join(', ')}]</span>`
           + ` ＝ 0，右侧 = <span class="num neg">${escapeHtml(r.combined_rhs)}</span> &lt; 0</p>`;
+    html += '<div class="row" style="margin-top:14px">'
+          +   '<div><label for="repair-id">稳定修复标识 repair_id</label>'
+          +   `<input type="text" id="repair-id" style="width:320px" value="${escapeAttr(rec.audit_id + '-fix-1')}" placeholder="repair_id"></div>`
+          +   '<div style="flex:0 0 auto;align-self:flex-end">'
+          +   '<button type="button" id="open-repair">发起最小上界放宽审计</button></div>'
+          + '</div>'
+          + '<div id="repair-error"></div>'
+          + '<p class="muted" style="margin:8px 0 0">服务将冻结本源审计的变量、约束顺序与原证据，'
+          + '先最小化全部放宽量之和，再按稳定约束标识序最小化放宽向量；原结论不会被改写。</p>';
   }
   document.getElementById('result-body').innerHTML = html;
+  const btn = document.getElementById('open-repair');
+  if (btn) btn.addEventListener('click', () => submitRepair(rec.audit_id));
 }
 
 document.getElementById('add-con').addEventListener('click', () => addConRow());
@@ -308,6 +339,111 @@ document.getElementById('fetch').addEventListener('click', async () => {
   const data = await resp.json();
   if (!resp.ok) { showError(`[${resp.status}] ${data.error || ''}`); return; }
   renderResult(data, true);
+});
+
+// ---- 最小上界放宽修复 ----
+async function submitRepair(auditId) {
+  const errEl = document.getElementById('repair-error');
+  errEl.innerHTML = '';
+  const repairId = document.getElementById('repair-id').value.trim();
+  if (!repairId) {
+    errEl.innerHTML = '<div class="err">请填写稳定修复标识 repair_id</div>';
+    return;
+  }
+  let resp, data;
+  try {
+    resp = await fetch('/api/repairs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({repair_id: repairId, audit_id: auditId})
+    });
+    data = await resp.json();
+  } catch (e) {
+    errEl.innerHTML = `<div class="err">网络错误: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (!resp.ok) {
+    errEl.innerHTML = `<div class="err">[${resp.status}] ${escapeHtml(data.error || '')}\n${escapeHtml(data.detail || '')}</div>`;
+    return;
+  }
+  document.getElementById('repair-fetch-id').value = repairId;
+  renderRepair(data);
+}
+
+function renderRepair(rec) {
+  const panel = document.getElementById('repair-panel');
+  panel.hidden = false;
+  const r = rec.result;
+  const src = rec.source;
+  const lex = (r.lex_order || []).map(e => '#' + (e.index + 1)).join(' → ') || '（无稳定约束）';
+  document.getElementById('repair-meta').innerHTML =
+    `修复编号 <b>${escapeHtml(rec.repair_id)}</b> · ` +
+    `${rec.replayed ? '重放冻结记录' : '首次冻结'} · ` +
+    `创建于 ${escapeHtml(rec.created_at)} · ` +
+    `来源审计 <b>${escapeHtml(src.audit_id)}</b> ` +
+    `（原矛盾式 <span class="num neg">${escapeHtml(src.original_evidence.combined_relation)}</span>，证据未改写）<br>` +
+    `总放宽量 T = <b>${escapeHtml(r.total_relaxation)}</b>（最小） · ` +
+    `稳定标识序字典序: ${lex} · ` +
+    `枢轴 ${JSON.stringify(r.pivots)}`;
+
+  let html = '<h3 style="margin:6px 0">放宽后的有理电流（精确）</h3>';
+  html += '<div class="scroll"><table><thead><tr><th>变量</th><th>电流值</th></tr></thead><tbody>';
+  for (const [k, v] of Object.entries(r.currents)) {
+    html += `<tr><td>${escapeHtml(k)}</td><td>${frac(v)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  html += '<h3 style="margin:14px 0 6px">逐约束放宽量 d_i 与新余量 (b_i+d_i) − a_i·x</h3>';
+  html += '<div class="scroll"><table><thead><tr>'
+        + '<th>#</th><th>原右端 b</th><th>放宽 d ≥ 0</th><th>新右端 b+d</th>'
+        + '<th>新余量</th><th>稳定</th></tr></thead><tbody>';
+  for (const it of r.items) {
+    html += `<tr><td>${it.index+1}${it.label ? ' <span class="tag">'+escapeHtml(it.label)+'</span>':''}</td>`
+          + `<td class="num">${escapeHtml(it.b)}</td>`
+          + `<td class="num ${it.increment.startsWith('-')?'neg':''}">${escapeHtml(it.increment)}</td>`
+          + `<td class="num">${escapeHtml(it.new_b)}</td>`
+          + `<td>${frac(it.residual)}</td>`
+          + `<td class="stable">${it.stable ? '✓' : ''}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  const d = r.dual;
+  html += `<h3 style="margin:14px 0 6px">最优性有界对偶证书（0 ≤ λ_i ≤ 1，Aᵀλ = 0）</h3>`;
+  html += '<div class="scroll"><table><thead><tr>'
+        + '<th>#</th><th>乘子 λ ∈[0,1]</th><th>加权系数 λ·a</th>'
+        + '<th>加权右端 λ·b</th></tr></thead><tbody>';
+  for (const t of d.terms) {
+    html += `<tr><td>${t.index+1}${t.label ? ' <span class="tag">'+escapeHtml(t.label)+'</span>':''}</td>`
+          + `<td>${frac(t.multiplier)}</td>`
+          + `<td><span class="num">[${t.weighted_coeffs.map(escapeHtml).join(', ')}]</span></td>`
+          + `<td class="num ${String(t.weighted_rhs).startsWith('-')?'neg':''}">${escapeHtml(t.weighted_rhs)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  html += `<p style="margin-top:10px">逐项核验：λ 均在 [0,1]；加权左侧合计 `
+        + `<span class="num">[${d.weighted_lhs.map(escapeHtml).join(', ')}]</span> = 0；`
+        + `−Σλ_i·b_i = <b>${escapeHtml(d.neg_weighted_rhs)}</b> `
+        + `= 最小总放宽量 <b>${escapeHtml(d.total_relaxation)}</b>。</p>`;
+  document.getElementById('repair-body').innerHTML = html;
+}
+
+document.getElementById('repair-fetch').addEventListener('click', async () => {
+  const errEl = document.getElementById('repair-fetch-error');
+  errEl.innerHTML = '';
+  const id = document.getElementById('repair-fetch-id').value.trim();
+  if (!id) { errEl.innerHTML = '<div class="err">请填写修复编号</div>'; return; }
+  let resp, data;
+  try {
+    resp = await fetch('/api/repairs/' + encodeURIComponent(id));
+    data = await resp.json();
+  } catch (e) {
+    errEl.innerHTML = `<div class="err">网络错误: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  if (!resp.ok) {
+    errEl.innerHTML = `<div class="err">[${resp.status}] ${escapeHtml(data.error || 'not_found')}</div>`;
+    return;
+  }
+  renderRepair(data);
 });
 
 // 初始化

@@ -135,6 +135,34 @@ def parse_payload(obj) -> AuditPayload:
     )
 
 
+@dataclass(frozen=True)
+class RepairRequest:
+    repair_id: str
+    audit_id: str
+
+
+def parse_repair_payload(obj) -> RepairRequest:
+    """校验放宽修复请求：仅允许 {repair_id, audit_id} 两个标识字段。"""
+    if not isinstance(obj, dict):
+        raise PayloadError("请求体必须是 JSON 对象")
+
+    def _id(field: str) -> str:
+        v = obj.get(field)
+        if not isinstance(v, str) or not v.strip():
+            raise PayloadError(f"{field} 必须是非空字符串")
+        v = v.strip()
+        if len(v) > MAX_ID_LEN or not _ID_RE.match(v):
+            raise PayloadError(
+                f"{field} 仅允许字母、数字、点、下划线、连字符与 @，且不超过 "
+                f"{MAX_ID_LEN} 个字符"
+            )
+        return v
+
+    repair_id = _id("repair_id")
+    audit_id = _id("audit_id")
+    return RepairRequest(repair_id=repair_id, audit_id=audit_id)
+
+
 def verify_certificate(result: dict) -> None:
     """对返回的不可行证书做独立核验，供测试与 verify 容器复用。
 
