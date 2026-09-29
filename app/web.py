@@ -6,6 +6,10 @@
   POST /api/audits           提交审计
        201 首次冻结; 200 同载荷重放; 409 同号不同载荷; 400 载荷非法
   GET  /api/audits/<id>      按审计编号读取冻结结果; 404 不存在
+  POST /api/repairs          对已冻结的“无解”审计发起最小上界放宽审计
+       201 首次冻结; 200 同来源重放;
+       404 来源不存在; 409 来源并非无解 / 改换来源; 400 请求非法
+  GET  /api/repairs/<id>     按修复编号读取冻结修复; 404 不存在
 """
 
 from __future__ import annotations
@@ -16,7 +20,15 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .models import PayloadError
-from .service import AuditService, IdConflictError
+from .repair_storage import RepairStore
+from .service import (
+    AuditService,
+    IdConflictError,
+    RepairConflictError,
+    SourceNotFoundError,
+    SourceNotInfeasibleError,
+    SourceTamperedError,
+)
 from .storage import AuditStore
 
 _DATA_DIR = os.environ.get("AUDIT_DATA_DIR", "/data")
@@ -75,12 +87,25 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json(HTTPStatus.OK, {"replayed": True, **record})
+        elif path.startswith("/api/repairs/"):
+            repair_id = path[len("/api/repairs/"):]
+            if not repair_id or "/" in repair_id:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
+                return
+            record = self.service.fetch_repair(repair_id)
+            if record is None:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {"error": "not_found", "repair_id": repair_id},
+                )
+            else:
+                self._send_json(HTTPStatus.OK, {"replayed": True, **record})
         else:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/api/audits":
+        if path not in ("/api/audits", "/api/repairs"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
             return
         try:
@@ -103,6 +128,12 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/repairs":
+            self._handle_repair(payload)
+        else:
+            self._handle_audit(payload)
+
+    def _handle_audit(self, payload):
         try:
             record, replayed = self.service.audit(payload)
         except PayloadError as exc:
@@ -130,10 +161,70 @@ class Handler(BaseHTTPRequestHandler):
             {"replayed": replayed, **record},
         )
 
+    def _handle_repair(self, payload):
+        try:
+            record, replayed = self.service.repair(payload)
+        except PayloadError as exc:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "invalid_payload", "detail": str(exc)},
+            )
+            return
+        except SourceNotFoundError as exc:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "source_not_found",
+                    "detail": "来源审计不存在，无法发起放宽审计",
+                    "source_audit_id": str(exc),
+                },
+            )
+            return
+        except SourceNotInfeasibleError as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "source_not_infeasible",
+                    "detail": "来源审计结论并非无解；只有无解审计可放宽",
+                    "source_audit_id": str(exc),
+                },
+            )
+            return
+        except SourceTamperedError as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "source_tampered",
+                    "detail": "来源记录指纹与载荷不符，已拒绝",
+                    "source_audit_id": str(exc),
+                },
+            )
+            return
+        except RepairConflictError as exc:
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": "repair_id_conflict",
+                    "detail": "同一修复标识已绑定其他来源；已冻结修复保持不变",
+                    "repair_id": exc.existing["repair_id"],
+                    "bound_source_audit_id": exc.existing["source_audit_id"],
+                    "bound_source_fingerprint": exc.existing["source_fingerprint"],
+                    "requested_source_audit_id": exc.new_source_audit_id,
+                    "requested_source_fingerprint": exc.new_source_fingerprint,
+                },
+            )
+            return
+
+        self._send_json(
+            HTTPStatus.OK if replayed else HTTPStatus.CREATED,
+            {"replayed": replayed, **record},
+        )
+
 
 def make_server(host: str = _HOST, port: int = _PORT, data_dir: str = _DATA_DIR):
     store = AuditStore(data_dir)
-    service = AuditService(store)
+    repair_store = RepairStore(data_dir)
+    service = AuditService(store, repair_store)
     Handler.service = service
     return ThreadingHTTPServer((host, port), Handler)
 

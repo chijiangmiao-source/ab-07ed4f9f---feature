@@ -68,15 +68,7 @@ def parse_payload(obj) -> AuditPayload:
     if not isinstance(obj, dict):
         raise PayloadError("请求体必须是 JSON 对象")
 
-    audit_id = obj.get("audit_id")
-    if not isinstance(audit_id, str) or not audit_id.strip():
-        raise PayloadError("audit_id 必须是非空字符串")
-    audit_id = audit_id.strip()
-    if len(audit_id) > MAX_ID_LEN or not _ID_RE.match(audit_id):
-        raise PayloadError(
-            "audit_id 仅允许字母、数字、点、下划线、连字符与 @，且不超过 "
-            f"{MAX_ID_LEN} 个字符"
-        )
+    audit_id = _validate_id(obj.get("audit_id"), "audit_id")
 
     raw_vars = obj.get("variables")
     if not isinstance(raw_vars, list) or not (1 <= len(raw_vars) <= MAX_VARS):
@@ -133,6 +125,94 @@ def parse_payload(obj) -> AuditPayload:
         constraints=tuple(constraints),
         stable_flags=tuple(stable_flags),
     )
+
+
+def _validate_id(raw, what: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise PayloadError(f"{what} 必须是非空字符串")
+    rid = raw.strip()
+    if len(rid) > MAX_ID_LEN or not _ID_RE.match(rid):
+        raise PayloadError(
+            f"{what} 仅允许字母、数字、点、下划线、连字符与 @，且不超过 "
+            f"{MAX_ID_LEN} 个字符"
+        )
+    return rid
+
+
+def parse_repair_request(obj) -> tuple[str, str]:
+    """解析最小上界放宽审计请求: {"repair_id", "source_audit_id"}。
+
+    来源的变量/约束/证据一律以已冻结的原审计记录为准，本请求不携带任何
+    数值载荷，杜绝借修复通道改写来源。
+    """
+    if not isinstance(obj, dict):
+        raise PayloadError("请求体必须是 JSON 对象")
+    repair_id = _validate_id(obj.get("repair_id"), "repair_id")
+    source_audit_id = _validate_id(obj.get("source_audit_id"), "source_audit_id")
+    return repair_id, source_audit_id
+
+
+def verify_relaxation_certificate(source_payload: dict, result: dict) -> None:
+    """仅依据冻结来源载荷与返回结果，独立核验放宽解与有界对偶证书。
+
+    弱对偶保证: 任何满足 Aᵀμ=0、0≤μ≤1 的 μ 都是最小放宽总量的下界；
+    一旦 −μᵀb 与实际 Σd 相等，总量最优即被证明，无需重新求解。
+    """
+    assert result["status"] == "repaired"
+    src_cons = source_payload["constraints"]
+    variables = source_payload["variables"]
+    m, n = len(src_cons), len(variables)
+    rows = result["constraints"]
+    assert len(rows) == m
+    currents = {k: Fraction(v) for k, v in result["currents"].items()}
+    assert set(currents) == set(variables)
+
+    total = Fraction(0)
+    for i, (row, src) in enumerate(zip(rows, src_cons)):
+        assert row["index"] == i
+        d = Fraction(row["relaxation"])
+        assert d >= 0, f"放宽量 d_{i} 为负"
+        total += d
+        b = Fraction(src["b"])
+        assert Fraction(row["b"]) == b
+        assert Fraction(row["new_b"]) == b + d
+        ax = sum(
+            (Fraction(src["coeffs"][j]) * currents[variables[j]]
+             for j in range(n)),
+            Fraction(0),
+        )
+        residual = b + d - ax
+        assert residual >= 0, f"约束 {i} 放宽后仍被违反"
+        assert Fraction(row["new_residual"]) == residual, (
+            f"约束 {i} 新余量不一致"
+        )
+    assert total == Fraction(result["total_relaxation"])
+
+    dual = result["dual"]
+    multipliers = [Fraction(x["value"]) for x in dual["multipliers"]]
+    assert len(multipliers) == m
+    lhs = [Fraction(0) for _ in range(n)]
+    rhs = Fraction(0)
+    for i, (term, src) in enumerate(zip(dual["terms"], src_cons)):
+        assert term["index"] == i
+        mu = multipliers[i]
+        assert Fraction(term["multiplier"]) == mu
+        assert 0 <= mu <= 1, f"对偶乘子 μ_{i}={mu} 越出 [0,1]"
+        assert Fraction(term["weighted_rhs"]) == mu * Fraction(src["b"])
+        assert Fraction(term["neg_weighted_rhs"]) == -mu * Fraction(src["b"])
+        w = [Fraction(s) for s in term["weighted_coeffs"]]
+        assert w == [mu * Fraction(a) for a in src["coeffs"]]
+        for j in range(n):
+            lhs[j] += w[j]
+        rhs += mu * Fraction(src["b"])
+    assert all(v == 0 for v in lhs), f"对偶左侧 Aᵀμ 必须为 0: {lhs}"
+    assert [Fraction(s) for s in dual["lhs_sum"]] == lhs
+    assert Fraction(dual["rhs_sum"]) == rhs
+    # 弱对偶等式: 可行对偶达到原问题总量 => 总量最小
+    assert Fraction(dual["neg_rhs_sum"]) == -rhs == total
+    # 稳定标识序必须是来源 stable=True 的约束按原索引升序
+    expect_order = [i for i, c in enumerate(src_cons) if c.get("stable", False)]
+    assert result["stable_order"] == expect_order
 
 
 def verify_certificate(result: dict) -> None:

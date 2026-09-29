@@ -91,7 +91,7 @@
   </section>
 
   <section class="panel">
-    <h2>3. 提交审计 / 按编号取回</h2>
+    <h2>3. 提交审计</h2>
     <div class="toprow">
       <div>
         <label for="audit-id">审计编号 audit_id</label>
@@ -109,6 +109,50 @@
     <h2>审计结果 <span id="result-badge"></span></h2>
     <div id="result-meta" class="muted" style="margin-bottom:10px"></div>
     <div id="result-body"></div>
+    <div id="repair-entry" hidden style="margin-top:16px; border-top:1px solid var(--line); padding-top:14px;">
+      <h3 style="margin:0 0 8px">最小上界放宽审计</h3>
+      <p class="muted" style="margin:0 0 10px">
+        来源结论为无解。可提交一个<b>稳定修复标识</b>（repair_id），以任意精度有理数先最小化
+        全部右端非负放宽量之和，再按稳定约束标识序最小化放宽向量；来源的变量、约束顺序与
+        原证据将被冻结快照，不会被改写。
+      </p>
+      <div class="toprow">
+        <div>
+          <label for="repair-id">稳定修复标识 repair_id</label>
+          <input type="text" id="repair-id" placeholder="如 trap-run-2026-09-28-A-fix1">
+        </div>
+        <div style="flex:0 0 auto">
+          <button id="submit-repair" type="button">发起放宽审计</button>
+        </div>
+      </div>
+      <div id="repair-error"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>4. 按编号重读冻结记录</h2>
+    <div class="toprow">
+      <div>
+        <label for="refetch-audit">原审计编号</label>
+        <input type="text" id="refetch-audit" placeholder="audit_id">
+      </div>
+      <div style="flex:0 0 auto">
+        <button class="secondary" id="refetch-audit-btn" type="button">取回原审计</button>
+      </div>
+      <div>
+        <label for="refetch-repair">修复编号</label>
+        <input type="text" id="refetch-repair" placeholder="repair_id">
+      </div>
+      <div style="flex:0 0 auto">
+        <button class="secondary" id="refetch-repair-btn" type="button">取回放宽审计</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="repair-panel" class="panel" hidden>
+    <h2>放宽审计结果 <span class="badge ok" style="background:rgba(96,165,250,.15);color:var(--accent)">已首次可行</span></h2>
+    <div id="repair-meta" class="muted" style="margin-bottom:10px"></div>
+    <div id="repair-body"></div>
   </section>
 </main>
 
@@ -270,7 +314,140 @@ function renderResult(rec, replayed) {
           + ` ＝ 0，右侧 = <span class="num neg">${escapeHtml(r.combined_rhs)}</span> &lt; 0</p>`;
   }
   document.getElementById('result-body').innerHTML = html;
+
+  // 仅“无解”详情可进入放宽审计；可行结果不显示入口
+  const entry = document.getElementById('repair-entry');
+  entry.hidden = r.status !== 'infeasible';
+  document.getElementById('repair-error').innerHTML = '';
+  if (r.status === 'infeasible') {
+    const inp = document.getElementById('repair-id');
+    if (!inp.value) inp.value = rec.audit_id + '-fix1';
+    currentSource = {
+      audit_id: rec.audit_id,
+      fingerprint: rec.fingerprint,
+      combined_rhs: r.combined_rhs
+    };
+  }
 }
+
+// ---- 放宽审计渲染 ----
+let currentSource = null;
+
+function showRepairError(msg) {
+  const el = document.getElementById('repair-error');
+  el.innerHTML = msg ? `<div class="err">${escapeHtml(msg)}</div>` : '';
+}
+
+function renderRepair(rec) {
+  const panel = document.getElementById('repair-panel');
+  panel.hidden = false;
+  const r = rec.result, src = rec.source;
+  document.getElementById('repair-meta').innerHTML =
+    `修复标识 <b>${escapeHtml(rec.repair_id)}</b> · ` +
+    `来源 <b>${escapeHtml(rec.source_audit_id)}</b> · ` +
+    `来源指纹 <span class="num">${escapeHtml(src.fingerprint.slice(0,25))}…</span> · ` +
+    `创建于 ${escapeHtml(rec.created_at)} · 枢轴 ${r.pivots} 次`;
+
+  let html = '<p>来源原证据结论为无解，合并矛盾式 <b>0 ≤ '
+    + escapeHtml(src.evidence.combined_rhs) + '</b>（已随修复冻结，不改写）。</p>';
+
+  html += '<h3 style="margin:10px 0 6px">最小放宽总量 t* = Σ dᵢ = '
+    + frac(r.total_relaxation) + '</h3>';
+  html += '<p class="muted" style="margin:0 0 8px">先最小化全部放宽量之和，'
+    + '再按稳定约束标识序 [' + r.stable_order.map(i => i + 1).join(', ')
+    + '] 字典序最小化放宽向量。</p>';
+
+  html += '<h4 style="margin:8px 0 4px">对应电流（放宽后系统的一组精确可行解）</h4>';
+  html += '<div class="scroll"><table><thead><tr><th>变量</th><th>电流值</th></tr></thead><tbody>';
+  for (const [k, v] of Object.entries(r.currents)) {
+    html += `<tr><td>${escapeHtml(k)}</td><td>${frac(v)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  html += '<h4 style="margin:12px 0 4px">逐约束新右端与新余量</h4>';
+  html += '<div class="scroll"><table><thead><tr>'
+    + '<th>#</th><th>稳定</th><th>原右端 b</th><th>放宽量 d</th>'
+    + '<th>新右端 b+d</th><th>新余量 (b+d)−a·x</th></tr></thead><tbody>';
+  for (const row of r.constraints) {
+    html += `<tr><td>${row.index + 1}${row.label ? ' <span class="tag">'+escapeHtml(row.label)+'</span>' : ''}</td>`
+      + `<td>${row.stable ? '✓' : ''}</td>`
+      + `<td class="num">${escapeHtml(row.b)}</td>`
+      + `<td class="num ${row.relaxation.startsWith('-') ? 'neg' : ''}">${escapeHtml(row.relaxation)}</td>`
+      + `<td class="num">${escapeHtml(row.new_b)}</td>`
+      + `<td>${frac(row.new_residual)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+
+  const d = r.dual;
+  html += '<h4 style="margin:12px 0 4px">证明最优下界的有界对偶乘子 μ</h4>';
+  html += '<p class="muted" style="margin:0 0 6px">逐项满足 0 ≤ μᵢ ≤ 1、'
+    + 'Σ μᵢ·aᵢ = 0，且 −Σ μᵢ·bᵢ = <b>' + escapeHtml(d.neg_rhs_sum)
+    + '</b> 恰等于最小放宽总量。</p>';
+  html += '<div class="scroll"><table><thead><tr>'
+    + '<th>#</th><th>乘子 μ</th><th>加权系数 μ·a</th>'
+    + '<th>μ·b</th><th>−μ·b</th></tr></thead><tbody>';
+  for (const t of d.terms) {
+    html += `<tr><td>${t.index + 1}</td>`
+      + `<td>${frac(t.multiplier)}</td>`
+      + `<td><span class="num">[${t.weighted_coeffs.map(escapeHtml).join(', ')}]</span></td>`
+      + `<td class="num">${escapeHtml(t.weighted_rhs)}</td>`
+      + `<td class="num ${t.neg_weighted_rhs.startsWith('-') ? 'neg' : ''}">${escapeHtml(t.neg_weighted_rhs)}</td></tr>`;
+  }
+  html += '</tbody></table></div>';
+  html += `<p style="margin-top:10px">左侧合计 <span class="num">[${d.lhs_sum.map(escapeHtml).join(', ')}]</span> ＝ 0；`
+    + `右侧加权负和 <span class="num">−(${escapeHtml(d.rhs_sum)})</span> = `
+    + `<span class="num frac">${escapeHtml(d.neg_rhs_sum)}</span> ＝ 最小放宽总量。</p>`;
+
+  document.getElementById('repair-body').innerHTML = html;
+}
+
+document.getElementById('submit-repair').addEventListener('click', async () => {
+  showRepairError('');
+  const repairId = document.getElementById('repair-id').value.trim();
+  if (!repairId) { showRepairError('请填写稳定修复标识 repair_id'); return; }
+  if (!currentSource) { showRepairError('请先提交或取回一个无解的来源审计'); return; }
+  try {
+    const resp = await fetch('/api/repairs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        repair_id: repairId,
+        source_audit_id: currentSource.audit_id
+      })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showRepairError(`[${resp.status}] ${data.error}\n${data.detail || ''}`
+        + (data.bound_source_audit_id
+            ? `\n该修复标识已绑定来源: ${data.bound_source_audit_id}` : ''));
+      return;
+    }
+    renderRepair(data);
+  } catch (e) { showRepairError('网络错误: ' + e.message); }
+});
+
+document.getElementById('refetch-audit-btn').addEventListener('click', async () => {
+  showError('');
+  const id = document.getElementById('refetch-audit').value.trim()
+    || document.getElementById('audit-id').value.trim();
+  if (!id) { showError('请填写原审计编号'); return; }
+  document.getElementById('audit-id').value = id;
+  const resp = await fetch('/api/audits/' + encodeURIComponent(id));
+  const data = await resp.json();
+  if (!resp.ok) { showError(`[${resp.status}] ${data.error || ''}`); return; }
+  renderResult(data, true);
+});
+
+document.getElementById('refetch-repair-btn').addEventListener('click', async () => {
+  showRepairError('');
+  const id = document.getElementById('refetch-repair').value.trim();
+  if (!id) { showRepairError('请填写修复编号'); return; }
+  const resp = await fetch('/api/repairs/' + encodeURIComponent(id));
+  const data = await resp.json();
+  if (!resp.ok) { showRepairError(`[${resp.status}] ${data.error || ''}`); return; }
+  document.getElementById('repair-id').value = data.repair_id;
+  renderRepair(data);
+});
 
 document.getElementById('add-con').addEventListener('click', () => addConRow());
 document.getElementById('add-var').addEventListener('click', () => {
